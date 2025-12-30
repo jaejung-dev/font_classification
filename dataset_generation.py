@@ -199,7 +199,8 @@ class ResizeWithPad:
             padding_color = self.padding_color
         original_shape = (image.shape[1], image.shape[0])
         ratio = float(max(self.new_shape)) / max(original_shape)
-        new_size = tuple([int(x * ratio) for x in original_shape])
+        # Prevent zero-dimension resize for extremely skinny images
+        new_size = tuple([max(1, int(round(x * ratio))) for x in original_shape])
         image = cv2.resize(image, new_size)
         delta_w = self.new_shape[0] - new_size[0]
         delta_h = self.new_shape[1] - new_size[1]

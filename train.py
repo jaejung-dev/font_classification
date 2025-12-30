@@ -1,8 +1,11 @@
 import albumentations as A
 import argparse
+import csv
 import cv2
+import math
 import numpy as np
 import os
+import random
 import timm
 import torch
 import torch.nn as nn
@@ -11,16 +14,43 @@ import torch.backends.cudnn as cudnn
 
 from PIL import Image
 from albumentations.pytorch import ToTensorV2
+from timm.data import resolve_model_data_config
 from pathlib import Path
 from torch.optim import lr_scheduler
 from torch.utils.tensorboard import SummaryWriter
 from torchvision.datasets import ImageFolder
 from tqdm import tqdm
-from typing import Tuple
+from typing import Tuple, List
+
+try:
+    from timm.layers import Mlp
+except Exception:
+    # Older timm versions keep Mlp under timm.models.layers
+    from timm.models.layers import Mlp
 
 # Set device
 cudnn.benchmark = True
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+MODEL_CHOICES = [
+    "resnet50",
+    "resnet101",
+    "resnet152",
+    "efficientnet_b0",
+    "efficientnet_b2",
+    "efficientnet_v2_s",
+    "convnext_small",
+    "convnext_base",
+    "swin_base_patch4_window7_224",
+    "vit_base_patch16_224",
+    "vit_large_patch16_dinov3.lvd1689m",
+    "vit_huge_plus_patch16_dinov3.lvd1689m",
+    "mobilenetv3_large_100",
+    "seresnext50_32x4d",
+]
+DINOV3_MODELS = [
+    "vit_large_patch16_dinov3.lvd1689m",
+    "vit_huge_plus_patch16_dinov3.lvd1689m",
+]
 
 
 def parse_args():
@@ -37,13 +67,13 @@ def parse_args():
     parser.add_argument(
         "--output_folder",
         type=str,
-        default="sample_data/model",
+        default="output",
         help="Path to the folder where the trained model will be saved",
     )
     parser.add_argument(
         "--test_split",
         type=float,
-        default=0.15,
+        default=0.01,
         help="Fraction of the dataset to be used for testing",
     )
     parser.add_argument(
@@ -51,17 +81,42 @@ def parse_args():
         "--network_type",
         type=str,
         default="resnet50",
-        help="Type of network architecture",
+        choices=MODEL_CHOICES,
+        help="Network architecture (timm). Examples: "
+        + ", ".join(MODEL_CHOICES),
     )
     parser.add_argument("-bs", "--batch_size", type=int, default=32, help="Batch size")
     parser.add_argument(
         "-lr", "--learning_rate", type=float, default=0.0001, help="Learning rate"
     )
     parser.add_argument(
+        "--backbone_lr_scale",
+        type=float,
+        default=0.2,
+        help="Scale factor for backbone LR when using DINOv3 models",
+    )
+    parser.add_argument(
         "-e", "--num_epochs", type=int, default=100, help="Number of epochs"
     )
     parser.add_argument(
         "--num_workers", type=int, default=4, help="Number of workers for dataloader"
+    )
+    parser.add_argument(
+        "--grad_clip_norm",
+        type=float,
+        default=1.0,
+        help="If >0, clip total grad norm to this value",
+    )
+    parser.add_argument(
+        "--debug_grad",
+        action="store_true",
+        help="Print grad norms on the first train step for quick sanity checks",
+    )
+    parser.add_argument(
+        "--top_k_fonts",
+        type=int,
+        default=3000,
+        help="Keep only the top-k classes by image count (<=0 means keep all)",
     )
 
     # Parse the arguments
@@ -87,6 +142,27 @@ class CustomImageFolder(ImageFolder):
         return sample, target
 
 
+def drop_broken_samples(samples: List[Tuple[str, int]]):
+    """
+    Remove images that cannot be opened or have zero width/height.
+    Returns (clean_samples, bad_list).
+    """
+    clean = []
+    bad = []
+    for path, target in samples:
+        try:
+            with Image.open(path) as img:
+                w, h = img.size
+                if w == 0 or h == 0:
+                    bad.append((path, "zero-dim", (w, h)))
+                    continue
+        except Exception as e:
+            bad.append((path, str(e), None))
+            continue
+        clean.append((path, target))
+    return clean, bad
+
+
 class ResizeWithPad:
 
     def __init__(
@@ -106,7 +182,8 @@ class ResizeWithPad:
         """
         original_shape = (image.shape[1], image.shape[0])
         ratio = float(max(self.new_shape)) / max(original_shape)
-        new_size = tuple([int(x * ratio) for x in original_shape])
+        # Avoid zero-sized dims when original shapes are extremely skinny/long
+        new_size = tuple([max(1, int(round(x * ratio))) for x in original_shape])
         image = cv2.resize(image, new_size)
         delta_w = self.new_shape[0] - new_size[0]
         delta_h = self.new_shape[1] - new_size[1]
@@ -139,27 +216,260 @@ class CutMax:
         return image
 
 
+def build_model(network_type: str, num_classes: int) -> nn.Module:
+    """
+    Create a classification model. For DINOv3 ViTs, drop the default head and
+    attach a small MLP head similar to the test notebook example.
+    """
+    if network_type in DINOV3_MODELS:
+        backbone = timm.create_model(
+            network_type, pretrained=True, num_classes=0, global_pool="avg"
+        )  # remove default head
+        # Allow non-multiple-of-patch sizes (e.g., 518) by padding inside patch embed
+        if hasattr(backbone, "patch_embed") and hasattr(
+            backbone.patch_embed, "dynamic_img_pad"
+        ):
+            backbone.patch_embed.dynamic_img_pad = True
+        in_dim = backbone.num_features
+        head = Mlp(
+            in_features=in_dim,
+            hidden_features=1024,
+            out_features=num_classes,
+            drop=0.1,
+        )
+        model = nn.Sequential(backbone, head)
+    else:
+        model = timm.create_model(
+            network_type, pretrained=True, num_classes=num_classes
+        )
+    return model
+
+
+def filter_dataset_top_k(dataset: CustomImageFolder, top_k: int):
+    """
+    Keep only the top-k classes by image count. Reindexes class ids.
+    Returns the filtered dataset and the kept class name list (in order).
+    """
+    if top_k is None or top_k <= 0 or top_k >= len(dataset.classes):
+        return dataset, list(dataset.classes)
+
+    old_classes = list(dataset.classes)
+    counts = [0 for _ in old_classes]
+    for _, target in dataset.samples:
+        counts[target] += 1
+
+    sorted_idx = sorted(
+        range(len(counts)), key=lambda i: (-counts[i], old_classes[i])
+    )
+    keep_idx = sorted_idx[:top_k]
+    keep_set = set(keep_idx)
+    keep_names = [old_classes[i] for i in keep_idx]
+    old_to_new = {old: new for new, old in enumerate(keep_idx)}
+
+    new_samples = []
+    new_targets = []
+    for path, target in dataset.samples:
+        if target in keep_set:
+            new_t = old_to_new[target]
+            new_samples.append((path, new_t))
+            new_targets.append(new_t)
+
+    dataset.samples = new_samples
+    dataset.imgs = new_samples  # alias used by ImageFolder
+    dataset.targets = new_targets
+    dataset.classes = keep_names
+    dataset.class_to_idx = {name: idx for idx, name in enumerate(keep_names)}
+    return dataset, keep_names
+
+
+def filter_dataset_to_classnames(dataset: CustomImageFolder, keep_names):
+    """
+    Filter dataset to an existing class name list and reindex targets to match.
+    """
+    if keep_names is None:
+        return dataset
+
+    keep_names = list(keep_names)
+    old_classes = list(dataset.classes)
+    name_to_old_idx = {name: idx for idx, name in enumerate(old_classes)}
+    keep_idx = [name_to_old_idx[n] for n in keep_names if n in name_to_old_idx]
+    keep_set = set(keep_idx)
+    old_to_new = {name: idx for idx, name in enumerate(keep_names)}
+
+    new_samples = []
+    new_targets = []
+    for path, target in dataset.samples:
+        if target in keep_set:
+            name = old_classes[target]
+            new_t = old_to_new[name]
+            new_samples.append((path, new_t))
+            new_targets.append(new_t)
+
+    dataset.samples = new_samples
+    dataset.imgs = new_samples
+    dataset.targets = new_targets
+    dataset.classes = keep_names
+    dataset.class_to_idx = {name: idx for idx, name in enumerate(keep_names)}
+    return dataset
+
+
+def compute_grad_norm(params) -> float:
+    """
+    L2 norm of gradients for a parameter iterable.
+    """
+    total = 0.0
+    for p in params:
+        if p.grad is not None:
+            param_norm = p.grad.data.norm(2)
+            total += param_norm.item() ** 2
+    return math.sqrt(total)
+
+
+def evaluate_model(model, dataloader, criterion, dataset_size):
+    """
+    Run a single evaluation pass; returns (loss, top1_acc, top5_acc).
+    """
+    model.eval()
+    running_loss = 0.0
+    running_corrects1 = 0
+    running_corrects5 = 0
+
+    with torch.no_grad():
+        for inputs, labels in tqdm(dataloader, leave=False):
+            inputs = inputs.to(device)
+            labels = labels.to(device)
+            with torch.cuda.amp.autocast():
+                outputs = model(inputs)
+                loss = criterion(outputs, labels)
+                _, preds1 = torch.max(outputs, 1)
+                _, top5 = torch.topk(outputs, k=min(5, outputs.shape[1]), dim=1)
+            running_loss += loss.item() * inputs.size(0)
+            running_corrects1 += torch.sum(preds1 == labels)
+            running_corrects5 += torch.sum(top5.eq(labels.view(-1, 1)).any(dim=1))
+
+    denom = max(1, dataset_size)
+    epoch_loss = running_loss / denom
+    epoch_acc1 = running_corrects1.double() / denom
+    epoch_acc5 = running_corrects5.double() / denom
+    return float(epoch_loss), float(epoch_acc1), float(epoch_acc5)
+
+
+def save_best_predictions(
+    model,
+    subset,
+    raw_dataset,
+    transform,
+    class_names,
+    output_folder,
+    epoch,
+    acc_top1,
+    acc_top5,
+    max_samples=100,
+):
+    """
+    On best val improvement, sample up to max_samples images from the validation subset,
+    run prediction, save images, and dump a CSV mapping (filename, predicted, target, src_path).
+    """
+    if not hasattr(subset, "indices"):
+        return
+
+    idx_list = list(subset.indices)
+    if not idx_list:
+        return
+
+    k = min(max_samples, len(idx_list))
+    chosen = random.sample(idx_list, k)
+
+    out_dir = os.path.join(
+        output_folder,
+        "best_samples",
+        f"epoch_{epoch}_acc_t1-{acc_top1:.4f}_t5-{acc_top5:.4f}",
+    )
+    os.makedirs(out_dir, exist_ok=True)
+    csv_path = os.path.join(out_dir, "predictions.csv")
+
+    model.eval()
+    rows = []
+    with torch.no_grad():
+        for i, idx in enumerate(chosen):
+            img, target = raw_dataset[idx]
+            src_path = raw_dataset.samples[idx][0]
+            arr = np.array(img)
+            tensor = transform(image=arr)["image"].unsqueeze(0).to(device)
+            with torch.cuda.amp.autocast():
+                outputs = model(tensor)
+                _, pred = torch.max(outputs, 1)
+            pred_idx = int(pred.item())
+            target_idx = int(target)
+            pred_name = class_names[pred_idx] if pred_idx < len(class_names) else ""
+            target_name = class_names[target_idx] if target_idx < len(class_names) else ""
+
+            # Save image as PNG
+            filename = f"sample_{i:04d}_pred-{pred_name}_gt-{target_name}.png"
+            Image.fromarray(arr).save(os.path.join(out_dir, filename))
+
+            rows.append(
+                {
+                    "filename": filename,
+                    "predicted": pred_name,
+                    "target": target_name,
+                    "src_path": src_path,
+                }
+            )
+
+    # Write CSV
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(
+            f, fieldnames=["filename", "predicted", "target", "src_path"]
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+
+
 def main(args):
     os.makedirs(args.output_folder, exist_ok=True)
+    model_output_dir = os.path.join(args.output_folder, args.network_type)
+    os.makedirs(model_output_dir, exist_ok=True)
+
+    # Access the arguments
+    image_folder = args.image_folder
+    network_type = args.network_type
+    is_dinov3 = network_type in DINOV3_MODELS
+
+    # Use timm data_config for the chosen backbone (aligns with HF model card)
+    cfg_model = timm.create_model(network_type, pretrained=True, num_classes=0)
+    data_cfg = resolve_model_data_config(cfg_model)
+    _, h, w = data_cfg["input_size"]
+    target_size = (w, h)
+    norm_mean = list(data_cfg["mean"])
+    norm_std = list(data_cfg["std"])
 
     # Define a custom transform function to preprocess the images using Albumentations
-    transform = A.Compose(
+    train_transform = A.Compose(
         [
             A.Lambda(image=CutMax(1024)),
-            A.Lambda(image=ResizeWithPad((320, 320))),  # Custom SquarePad
+            A.Lambda(image=ResizeWithPad(target_size)),  # Custom SquarePad
             A.ShiftScaleRotate(
-                shift_limit=0.5,
-                scale_limit=(0.8, 2),
-                rotate_limit=60,
+                shift_limit=0.1,
+                scale_limit=(0.8, 1.0),
+                rotate_limit=10,
                 interpolation=1,
                 p=0.7,
             ),
-            # A.RandomBrightnessContrast(p=0.2),
             A.ColorJitter(p=0.2),
             A.ISONoise(p=0.2),
             A.ImageCompression(quality_lower=70, quality_upper=95, p=0.2),
-            # A.CenterCrop(320, 320),
-            A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            A.Normalize(mean=norm_mean, std=norm_std),
+            ToTensorV2(),
+        ]
+    )
+
+    # Validation: no heavy augmentation, only resize/normalize
+    val_transform = A.Compose(
+        [
+            A.Lambda(image=CutMax(1024)),
+            A.Lambda(image=ResizeWithPad(target_size)),
+            A.Normalize(mean=norm_mean, std=norm_std),
             ToTensorV2(),
         ]
     )
@@ -167,53 +477,92 @@ def main(args):
     check_transform = A.Compose(
         [
             A.Lambda(image=CutMax(1024)),
-            A.Lambda(image=ResizeWithPad((320, 320))),  # Custom SquarePad
+            A.Lambda(image=ResizeWithPad(target_size)),  # Custom SquarePad
             A.ShiftScaleRotate(
-                shift_limit_x=0.5,
-                shift_limit_y=0.3,
-                scale_limit=(0.8, 2),
-                rotate_limit=50,
+                shift_limit_x=0.1,
+                shift_limit_y=0.1,
+                scale_limit=(0.8, 1.0),
+                rotate_limit=10,
                 interpolation=1,
                 p=0.7,
             ),
-            # A.CenterCrop(224, 224),
             A.ColorJitter(p=0.2),
             A.ISONoise(p=0.2),
             A.ImageCompression(quality_lower=70, quality_upper=95, p=0.2),
         ]
     )
 
-    # Access the arguments
-    image_folder = args.image_folder
-    # label_file = args.label_file
-    network_type = args.network_type
-    best_model_params_path = os.path.join(args.output_folder, "best_model_params.pt")
+    best_model_params_path = os.path.join(model_output_dir, "best_model_params.pt")
 
-    # Create an instance of the custom dataset
-    # dataset = CustomDataset(image_folder, label_file, transform=transform)
-    dataset = CustomImageFolder(image_folder, transform=transform)
+    # Create dataset (train/val) and a raw copy for saving images
+    dataset = CustomImageFolder(image_folder, transform=train_transform)
+    raw_dataset = CustomImageFolder(image_folder, transform=None)
+
+    # Drop broken images (cannot open or zero-dim) to avoid cv2 resize errors
+    dataset.samples, bad_train = drop_broken_samples(dataset.samples)
+    dataset.imgs = dataset.samples
+    dataset.targets = [t for _, t in dataset.samples]
+
+    raw_dataset.samples, bad_raw = drop_broken_samples(raw_dataset.samples)
+    raw_dataset.imgs = raw_dataset.samples
+    raw_dataset.targets = [t for _, t in raw_dataset.samples]
+
+    if bad_train or bad_raw:
+        dropped = len(set([p for p, _, _ in bad_train + bad_raw]))
+        print(f"[warn] dropped {dropped} broken images (see paths below)")
+        for p, reason, shape in bad_train + bad_raw:
+            print(f"  - {p} | {reason} | shape={shape}")
+
+    dataset, kept_class_names = filter_dataset_top_k(dataset, args.top_k_fonts)
+    raw_dataset = filter_dataset_to_classnames(raw_dataset, kept_class_names)
+    class_names = dataset.classes
+    print(
+        f"Dataset after top_k filter: {len(class_names)} classes, {len(dataset)} images "
+        f"(top_k_fonts={args.top_k_fonts})"
+    )
+
+    # Build a validation dataset with light transforms (no augmentation)
+    val_dataset_full = CustomImageFolder(image_folder, transform=val_transform)
+    val_dataset_full.samples = list(dataset.samples)
+    val_dataset_full.imgs = val_dataset_full.samples
+    val_dataset_full.targets = list(dataset.targets)
+    val_dataset_full.classes = list(dataset.classes)
+    val_dataset_full.class_to_idx = dict(dataset.class_to_idx)
+
     n = len(dataset)  # total number of examples
     n_test = int(args.test_split * n)  # take ~10% for test
-    train_dataset, test_dataset = torch.utils.data.random_split(
-        dataset, [n - n_test, n_test]
+    if n_test <= 0 and n > 1:
+        n_test = 1
+    if n_test >= n and n > 1:
+        n_test = n - 1
+
+    indices = torch.randperm(n)
+    val_indices = indices[:n_test].tolist()
+    train_indices = indices[n_test:].tolist()
+
+    train_dataset = torch.utils.data.Subset(dataset, train_indices)
+    val_dataset = torch.utils.data.Subset(val_dataset_full, val_indices)
+    print(
+        f"Split sizes -> train: {len(train_dataset)}, val: {len(val_dataset)} "
+        f"(test_split={args.test_split})"
     )
 
     check_dataset = CustomImageFolder(image_folder, transform=check_transform)
-    Path(os.path.join(args.output_folder, "check")).mkdir(parents=True, exist_ok=True)
+    check_dataset = filter_dataset_to_classnames(check_dataset, kept_class_names)
+    Path(os.path.join(model_output_dir, "check")).mkdir(parents=True, exist_ok=True)
     for i, data in zip(range(100), check_dataset):
         img = data[0]
-        Image.fromarray(img).save(os.path.join(args.output_folder, "check", f"{i}.png"))
+        Image.fromarray(img).save(os.path.join(model_output_dir, "check", f"{i}.png"))
 
     # Save classnames to a txt file
-    class_names = dataset.classes
-    with open(os.path.join(args.output_folder, "class_names.txt"), "w") as f:
+    with open(os.path.join(model_output_dir, "class_names.txt"), "w") as f:
         for item in class_names:
             f.write(f"{item}\n")
     print(f"Found {len(class_names)} classes.")
 
     # test_set = torch.utils.data.Subset(dataset, range(n_test))  # take first 10%
     # train_set = torch.utils.data.Subset(dataset, range(n_test, n))  # take the rest
-    dataset_sizes = {"train": len(train_dataset), "val": len(test_dataset)}
+    dataset_sizes = {"train": len(train_dataset), "val": len(val_dataset)}
 
     # Create a dataloader for the dataset
     batch_size = args.batch_size
@@ -221,22 +570,37 @@ def main(args):
         train_dataset, num_workers=args.num_workers, batch_size=batch_size, shuffle=True
     )
     test_dataloader = torch.utils.data.DataLoader(
-        test_dataset, num_workers=args.num_workers, batch_size=batch_size, shuffle=True
+        val_dataset, num_workers=args.num_workers, batch_size=batch_size, shuffle=False
     )
     dataloaders = {"train": train_dataloader, "val": test_dataloader}
 
-    # Define the ResNet model
-    model = timm.create_model(
-        network_type, pretrained=True, num_classes=len(class_names)
-    )
+    # Build the selected model
+    model = build_model(network_type, len(class_names))
     model.to(device)
 
     # Define the loss function and optimizer
     # criterion = nn.BCEWithLogitsLoss()
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.AdamW(
-        model.parameters(), lr=args.learning_rate, weight_decay=1e-4
-    )
+    backbone_params = None
+    head_params = None
+    if is_dinov3 and isinstance(model, nn.Sequential) and len(model) >= 2:
+        backbone_params = list(model[0].parameters())
+        head_params = list(model[1].parameters())
+        optimizer = optim.AdamW(
+            [
+                {
+                    "params": backbone_params,
+                    "lr": args.learning_rate * args.backbone_lr_scale,
+                },
+                {"params": head_params, "lr": args.learning_rate},
+            ],
+            weight_decay=1e-4,
+        )
+    else:
+        optimizer = optim.AdamW(
+            model.parameters(), lr=args.learning_rate, weight_decay=1e-4
+        )
+    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
 
     # Decay LR by a factor of 0.1 every 7 epochs
     # scheduler = lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.2)
@@ -248,8 +612,19 @@ def main(args):
     # Create a TensorBoard writer
     writer = SummaryWriter()
 
+    # Initial inference on validation set before training
+    init_loss, init_acc1, init_acc5 = evaluate_model(
+        model, dataloaders["val"], criterion, dataset_sizes["val"]
+    )
+    print(
+        f"Initial val -> Loss: {init_loss:.4f} "
+        f"Top1: {init_acc1:.4f} Top5: {init_acc5:.4f}"
+    )
+
     # Training loop
-    best_acc = 0.0
+    best_acc1 = 0.0
+    best_acc5 = 0.0
+    best_score = -float("inf")
 
     for epoch in range(args.num_epochs):
         print(f"Epoch {epoch}/{args.num_epochs - 1}")
@@ -263,15 +638,17 @@ def main(args):
                 model.eval()  # Set model to evaluate mode
 
             running_loss = 0.0
-            running_corrects = 0
+            running_corrects1 = 0
+            running_corrects5 = 0
 
             # Iterate over data.
-            for inputs, labels in tqdm(dataloaders[phase]):
+            progress = tqdm(dataloaders[phase])
+            for step_idx, (inputs, labels) in enumerate(progress):
                 inputs = inputs.to(device)
                 labels = labels.to(device)
 
                 # zero the parameter gradients
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
 
                 # forward
                 # track history if only in train
@@ -279,35 +656,85 @@ def main(args):
                     # ⭐️ ⭐️ Autocasting
                     with torch.cuda.amp.autocast():
                         outputs = model(inputs)
-                        _, preds = torch.max(outputs, 1)
                         loss = criterion(outputs, labels)
+                        _, preds1 = torch.max(outputs, 1)
+                        _, top5 = torch.topk(outputs, k=min(5, outputs.shape[1]), dim=1)
 
                     # backward + optimize only if in training phase
                     if phase == "train":
-                        loss.backward()
-                        optimizer.step()
+                        scaler.scale(loss).backward()
+                        if scaler.is_enabled():
+                            scaler.unscale_(optimizer)
+                        if args.grad_clip_norm and args.grad_clip_norm > 0:
+                            nn.utils.clip_grad_norm_(
+                                model.parameters(), args.grad_clip_norm
+                            )
+                        if args.debug_grad and epoch == 0 and step_idx == 0:
+                            if backbone_params and head_params:
+                                bnorm = compute_grad_norm(backbone_params)
+                                hnorm = compute_grad_norm(head_params)
+                                print(
+                                    f"[debug] grad_norm backbone={bnorm:.4f} head={hnorm:.4f}"
+                                )
+                            else:
+                                all_params = list(model.parameters())
+                                total_norm = compute_grad_norm(all_params)
+                                print(f"[debug] grad_norm total={total_norm:.4f}")
+                        scaler.step(optimizer)
+                        scaler.update()
 
                 # statistics
-                running_loss += loss.item() * inputs.size(0)
-                running_corrects += torch.sum(preds == labels.data)
+                batch_loss = float(loss.detach().item())
+                running_loss += batch_loss * inputs.size(0)
+                running_corrects1 += torch.sum(preds1 == labels.data)
+                running_corrects5 += torch.sum(top5.eq(labels.view(-1, 1)).any(dim=1))
+
+                # Show step loss every 50 steps on tqdm
+                if phase == "train" and (step_idx + 1) % 50 == 0:
+                    progress.set_postfix({"step_loss": f"{batch_loss:.4f}"})
             if phase == "train":
                 scheduler.step()
 
-            epoch_loss = running_loss / dataset_sizes[phase]
-            epoch_acc = running_corrects.double() / dataset_sizes[phase]
+            denom = dataset_sizes[phase]
+            epoch_loss = running_loss / denom
+            epoch_acc1 = running_corrects1.double() / denom
+            epoch_acc5 = running_corrects5.double() / denom
 
-            print(f"{phase} Loss: {epoch_loss:.4f} Acc: {epoch_acc:.4f}")
+            print(
+                f"{phase} Loss: {epoch_loss:.4f} "
+                f"Top1: {epoch_acc1:.4f} Top5: {epoch_acc5:.4f}"
+            )
 
             # Write the loss to TensorBoard
-            writer.add_scalar("Loss", epoch_loss, epoch)
-            writer.add_scalar("Accuracy", epoch_acc, epoch)
+            writer.add_scalar(f"{phase}/Loss", epoch_loss, epoch)
+            writer.add_scalar(f"{phase}/Top1", epoch_acc1, epoch)
+            writer.add_scalar(f"{phase}/Top5", epoch_acc5, epoch)
 
             # deep copy the model
-            if phase == "val" and epoch_acc > best_acc:
-                best_acc = epoch_acc
-                torch.save(model.state_dict(), best_model_params_path)
+            if phase == "val":
+                score = float(epoch_acc1 + epoch_acc5)
+                if score > best_score:
+                    best_score = score
+                    best_acc1 = float(epoch_acc1)
+                    best_acc5 = float(epoch_acc5)
+                    torch.save(model.state_dict(), best_model_params_path)
+                    save_best_predictions(
+                        model,
+                        val_dataset,
+                        raw_dataset,
+                        val_transform,
+                        class_names,
+                        model_output_dir,
+                        epoch,
+                        best_acc1,
+                        best_acc5,
+                        max_samples=100,
+                    )
 
-        print(f"Best val Acc: {best_acc:4f}")
+        print(
+            f"Best val -> Top1: {best_acc1:.4f} Top5: {best_acc5:.4f} "
+            f"(score=Top1+Top5={best_score:.4f})"
+        )
 
         # load best model weights
         model.load_state_dict(torch.load(best_model_params_path))
@@ -316,7 +743,7 @@ def main(args):
 
     # Save the trained model
     torch.save(
-        model.state_dict(), os.path.join(args.output_folder, "trained_model.pth")
+        model.state_dict(), os.path.join(model_output_dir, "trained_model.pth")
     )
 
     # Close the TensorBoard writer
