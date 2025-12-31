@@ -118,6 +118,23 @@ def parse_args():
         default=3000,
         help="Keep only the top-k classes by image count (<=0 means keep all)",
     )
+    parser.add_argument(
+        "--eval_only",
+        action="store_true",
+        help="Run evaluation on the validation set using a checkpoint and exit",
+    )
+    parser.add_argument(
+        "--checkpoint_path",
+        type=str,
+        default=None,
+        help="Path to checkpoint for eval-only mode; defaults to output/<net>/best_model_params.pt",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Random seed for reproducibility (dataset split, torch/np/random).",
+    )
 
     # Parse the arguments
     args = parser.parse_args()
@@ -313,6 +330,40 @@ def filter_dataset_to_classnames(dataset: CustomImageFolder, keep_names):
     return dataset
 
 
+def build_family_mapping(class_names: List[str]):
+    """
+    Map each class index to a family index using the prefix before '--'.
+    Returns (family_names, class_idx_to_family_idx, missing_delim_names).
+    """
+    family_to_idx = {}
+    family_names = []
+    class_idx_to_family = []
+    missing = []
+    for name in class_names:
+        if "--" in name:
+            family = name.split("--", 1)[0]
+        else:
+            family = name
+            missing.append(name)
+        if family not in family_to_idx:
+            family_to_idx[family] = len(family_names)
+            family_names.append(family)
+        class_idx_to_family.append(family_to_idx[family])
+    return family_names, class_idx_to_family, missing
+
+
+def set_seed(seed: int):
+    """
+    Set all relevant seeds for reproducibility and enable deterministic cuDNN.
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    cudnn.deterministic = True
+    cudnn.benchmark = False
+
+
 def compute_grad_norm(params) -> float:
     """
     L2 norm of gradients for a parameter iterable.
@@ -325,14 +376,15 @@ def compute_grad_norm(params) -> float:
     return math.sqrt(total)
 
 
-def evaluate_model(model, dataloader, criterion, dataset_size):
+def evaluate_model(model, dataloader, criterion, dataset_size, family_ids=None):
     """
-    Run a single evaluation pass; returns (loss, top1_acc, top5_acc).
+    Run a single evaluation pass; returns (loss, top1_acc, top5_acc, family_top1_acc).
     """
     model.eval()
     running_loss = 0.0
     running_corrects1 = 0
     running_corrects5 = 0
+    running_family_corrects1 = 0
 
     with torch.no_grad():
         for inputs, labels in tqdm(dataloader, leave=False):
@@ -346,12 +398,24 @@ def evaluate_model(model, dataloader, criterion, dataset_size):
             running_loss += loss.item() * inputs.size(0)
             running_corrects1 += torch.sum(preds1 == labels)
             running_corrects5 += torch.sum(top5.eq(labels.view(-1, 1)).any(dim=1))
+            if family_ids is not None:
+                family_preds1 = family_ids[preds1]
+                family_labels = family_ids[labels]
+                running_family_corrects1 += torch.sum(family_preds1 == family_labels)
 
     denom = max(1, dataset_size)
     epoch_loss = running_loss / denom
     epoch_acc1 = running_corrects1.double() / denom
     epoch_acc5 = running_corrects5.double() / denom
-    return float(epoch_loss), float(epoch_acc1), float(epoch_acc5)
+    epoch_family_acc1 = (
+        running_family_corrects1.double() / denom if family_ids is not None else 0.0
+    )
+    return (
+        float(epoch_loss),
+        float(epoch_acc1),
+        float(epoch_acc5),
+        float(epoch_family_acc1),
+    )
 
 
 def save_best_predictions(
@@ -364,6 +428,7 @@ def save_best_predictions(
     epoch,
     acc_top1,
     acc_top5,
+    acc_family_top1=None,
     max_samples=100,
 ):
     """
@@ -380,10 +445,14 @@ def save_best_predictions(
     k = min(max_samples, len(idx_list))
     chosen = random.sample(idx_list, k)
 
+    family_suffix = ""
+    if acc_family_top1 is not None:
+        family_suffix = f"_famt1-{acc_family_top1:.4f}"
+
     out_dir = os.path.join(
         output_folder,
         "best_samples",
-        f"epoch_{epoch}_acc_t1-{acc_top1:.4f}_t5-{acc_top5:.4f}",
+        f"epoch_{epoch}_acc_t1-{acc_top1:.4f}_t5-{acc_top5:.4f}{family_suffix}",
     )
     os.makedirs(out_dir, exist_ok=True)
     csv_path = os.path.join(out_dir, "predictions.csv")
@@ -427,6 +496,10 @@ def save_best_predictions(
 
 
 def main(args):
+    if args.seed is not None:
+        print(f"[seed] Setting seed to {args.seed} (deterministic cuDNN, fixed split)")
+        set_seed(args.seed)
+
     os.makedirs(args.output_folder, exist_ok=True)
     model_output_dir = os.path.join(args.output_folder, args.network_type)
     os.makedirs(model_output_dir, exist_ok=True)
@@ -516,6 +589,16 @@ def main(args):
     dataset, kept_class_names = filter_dataset_top_k(dataset, args.top_k_fonts)
     raw_dataset = filter_dataset_to_classnames(raw_dataset, kept_class_names)
     class_names = dataset.classes
+    family_names, class_idx_to_family, missing_family_delim = build_family_mapping(
+        class_names
+    )
+    if missing_family_delim:
+        print(
+            "[warn] Some class names lack '--' delimiter; using full name as family:"
+        )
+        for name in missing_family_delim:
+            print(f"  - {name}")
+    family_ids = torch.tensor(class_idx_to_family, device=device)
     print(
         f"Dataset after top_k filter: {len(class_names)} classes, {len(dataset)} images "
         f"(top_k_fonts={args.top_k_fonts})"
@@ -602,6 +685,24 @@ def main(args):
         )
     scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
 
+    # Eval-only mode: load checkpoint, run evaluation, and exit
+    if args.eval_only:
+        ckpt_path = args.checkpoint_path or best_model_params_path
+        if not os.path.exists(ckpt_path):
+            print(f"[error] checkpoint not found: {ckpt_path}")
+            return
+        state = torch.load(ckpt_path, map_location=device)
+        model.load_state_dict(state)
+        val_loss, val_acc1, val_acc5, val_family_acc1 = evaluate_model(
+            model, dataloaders["val"], criterion, dataset_sizes["val"], family_ids
+        )
+        print(
+            f"[eval-only] Loss: {val_loss:.4f} "
+            f"Top1: {val_acc1:.4f} Top5: {val_acc5:.4f} "
+            f"FamilyTop1: {val_family_acc1:.4f}"
+        )
+        return
+
     # Decay LR by a factor of 0.1 every 7 epochs
     # scheduler = lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.2)
     # lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.num_epochs, eta_min=0)
@@ -613,12 +714,13 @@ def main(args):
     writer = SummaryWriter()
 
     # Initial inference on validation set before training
-    init_loss, init_acc1, init_acc5 = evaluate_model(
-        model, dataloaders["val"], criterion, dataset_sizes["val"]
+    init_loss, init_acc1, init_acc5, init_family_acc1 = evaluate_model(
+        model, dataloaders["val"], criterion, dataset_sizes["val"], family_ids
     )
     print(
         f"Initial val -> Loss: {init_loss:.4f} "
-        f"Top1: {init_acc1:.4f} Top5: {init_acc5:.4f}"
+        f"Top1: {init_acc1:.4f} Top5: {init_acc5:.4f} "
+        f"FamilyTop1: {init_family_acc1:.4f}"
     )
 
     # Training loop
@@ -640,6 +742,7 @@ def main(args):
             running_loss = 0.0
             running_corrects1 = 0
             running_corrects5 = 0
+            running_family_corrects1 = 0
 
             # Iterate over data.
             progress = tqdm(dataloaders[phase])
@@ -659,6 +762,8 @@ def main(args):
                         loss = criterion(outputs, labels)
                         _, preds1 = torch.max(outputs, 1)
                         _, top5 = torch.topk(outputs, k=min(5, outputs.shape[1]), dim=1)
+                        family_preds1 = family_ids[preds1]
+                        family_labels = family_ids[labels]
 
                     # backward + optimize only if in training phase
                     if phase == "train":
@@ -688,6 +793,9 @@ def main(args):
                 running_loss += batch_loss * inputs.size(0)
                 running_corrects1 += torch.sum(preds1 == labels.data)
                 running_corrects5 += torch.sum(top5.eq(labels.view(-1, 1)).any(dim=1))
+                running_family_corrects1 += torch.sum(
+                    family_preds1 == family_labels
+                )
 
                 # Show step loss every 50 steps on tqdm
                 if phase == "train" and (step_idx + 1) % 50 == 0:
@@ -699,16 +807,19 @@ def main(args):
             epoch_loss = running_loss / denom
             epoch_acc1 = running_corrects1.double() / denom
             epoch_acc5 = running_corrects5.double() / denom
+            epoch_family_acc1 = running_family_corrects1.double() / denom
 
             print(
                 f"{phase} Loss: {epoch_loss:.4f} "
-                f"Top1: {epoch_acc1:.4f} Top5: {epoch_acc5:.4f}"
+                f"Top1: {epoch_acc1:.4f} Top5: {epoch_acc5:.4f} "
+                f"FamilyTop1: {epoch_family_acc1:.4f}"
             )
 
             # Write the loss to TensorBoard
             writer.add_scalar(f"{phase}/Loss", epoch_loss, epoch)
             writer.add_scalar(f"{phase}/Top1", epoch_acc1, epoch)
             writer.add_scalar(f"{phase}/Top5", epoch_acc5, epoch)
+            writer.add_scalar(f"{phase}/FamilyTop1", epoch_family_acc1, epoch)
 
             # deep copy the model
             if phase == "val":
@@ -728,6 +839,7 @@ def main(args):
                         epoch,
                         best_acc1,
                         best_acc5,
+                        epoch_family_acc1,
                         max_samples=100,
                     )
 
