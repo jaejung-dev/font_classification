@@ -7,7 +7,7 @@ import torch
 
 from albumentations.pytorch import ToTensorV2
 from timm.data import resolve_model_data_config
-from train import CutMax, ResizeWithPad
+from train import CutMax, ResizeWithPad, build_model
 from PIL import Image
 
 
@@ -53,9 +53,8 @@ def main(args):
     norm_mean = list(data_cfg["mean"])
     norm_std = list(data_cfg["std"])
 
-    model = timm.create_model(
-        args.network_type, pretrained=False, num_classes=len(class_names)
-    )
+    # Build model exactly as in training (handles DINOv3 sequential head)
+    model = build_model(args.network_type, len(class_names))
     model.to(device)
 
     model_path = os.path.join(args.model_folder, "trained_model.pth")
