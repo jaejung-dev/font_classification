@@ -34,6 +34,9 @@ share/python-wheels/
 MANIFEST
 output/
 output2/
+output_first_1000_font_v0/
+output_with_aug/
+output_without_aug/
 runs/
 
 # PyInstaller

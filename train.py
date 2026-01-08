@@ -65,10 +65,22 @@ def parse_args():
         help="Path to the folder containing the images",
     )
     parser.add_argument(
+        "--extra_image_folders",
+        type=str,
+        default=None,
+        help="Comma-separated additional train folders to concatenate with image_folder",
+    )
+    parser.add_argument(
         "--output_folder",
         type=str,
         default="output",
         help="Path to the folder where the trained model will be saved",
+    )
+    parser.add_argument(
+        "--val_folder",
+        type=str,
+        default=None,
+        help="Optional path to a separate validation folder (skips random split)",
     )
     parser.add_argument(
         "--test_split",
@@ -506,6 +518,7 @@ def main(args):
 
     # Access the arguments
     image_folder = args.image_folder
+    val_folder = args.val_folder
     network_type = args.network_type
     is_dinov3 = network_type in DINOV3_MODELS
 
@@ -568,26 +581,50 @@ def main(args):
     best_model_params_path = os.path.join(model_output_dir, "best_model_params.pt")
 
     # Create dataset (train/val) and a raw copy for saving images
-    dataset = CustomImageFolder(image_folder, transform=train_transform)
-    raw_dataset = CustomImageFolder(image_folder, transform=None)
+    def _load_clean(folder: str, transform):
+        ds = CustomImageFolder(folder, transform=transform)
+        ds.samples, bad = drop_broken_samples(ds.samples)
+        ds.imgs = ds.samples
+        ds.targets = [t for _, t in ds.samples]
+        return ds, bad
 
-    # Drop broken images (cannot open or zero-dim) to avoid cv2 resize errors
-    dataset.samples, bad_train = drop_broken_samples(dataset.samples)
-    dataset.imgs = dataset.samples
-    dataset.targets = [t for _, t in dataset.samples]
+    dataset, bad_train = _load_clean(image_folder, train_transform)
+    raw_train_dataset, bad_raw_train = _load_clean(image_folder, None)
 
-    raw_dataset.samples, bad_raw = drop_broken_samples(raw_dataset.samples)
-    raw_dataset.imgs = raw_dataset.samples
-    raw_dataset.targets = [t for _, t in raw_dataset.samples]
+    # Merge extra train folders if provided
+    extra_folders = []
+    if args.extra_image_folders:
+        extra_folders = [p for p in args.extra_image_folders.split(",") if p.strip()]
 
-    if bad_train or bad_raw:
-        dropped = len(set([p for p, _, _ in bad_train + bad_raw]))
+    for extra in extra_folders:
+        extra_ds, bad_extra = _load_clean(extra, train_transform)
+        extra_raw, bad_extra_raw = _load_clean(extra, None)
+        # Ensure class mapping matches
+        if extra_ds.class_to_idx != dataset.class_to_idx:
+            raise ValueError(
+                f"Class mapping mismatch between base folder and extra folder {extra}"
+            )
+        dataset.samples.extend(extra_ds.samples)
+        dataset.imgs = dataset.samples
+        dataset.targets = [t for _, t in dataset.samples]
+
+        raw_train_dataset.samples.extend(extra_raw.samples)
+        raw_train_dataset.imgs = raw_train_dataset.samples
+        raw_train_dataset.targets = [t for _, t in raw_train_dataset.samples]
+
+        bad_train += bad_extra
+        bad_raw_train += bad_extra_raw
+
+    if bad_train or bad_raw_train:
+        dropped = len(set([p for p, _, _ in bad_train + bad_raw_train]))
         print(f"[warn] dropped {dropped} broken images (see paths below)")
-        for p, reason, shape in bad_train + bad_raw:
+        for p, reason, shape in bad_train + bad_raw_train:
             print(f"  - {p} | {reason} | shape={shape}")
 
     dataset, kept_class_names = filter_dataset_top_k(dataset, args.top_k_fonts)
-    raw_dataset = filter_dataset_to_classnames(raw_dataset, kept_class_names)
+    raw_train_dataset = filter_dataset_to_classnames(
+        raw_train_dataset, kept_class_names
+    )
     class_names = dataset.classes
     family_names, class_idx_to_family, missing_family_delim = build_family_mapping(
         class_names
@@ -604,34 +641,79 @@ def main(args):
         f"(top_k_fonts={args.top_k_fonts})"
     )
 
+    raw_dataset = raw_train_dataset
     # Build a validation dataset with light transforms (no augmentation)
-    val_dataset_full = CustomImageFolder(image_folder, transform=val_transform)
-    val_dataset_full.samples = list(dataset.samples)
-    val_dataset_full.imgs = val_dataset_full.samples
-    val_dataset_full.targets = list(dataset.targets)
-    val_dataset_full.classes = list(dataset.classes)
-    val_dataset_full.class_to_idx = dict(dataset.class_to_idx)
+    if val_folder:
+        val_dataset_full = CustomImageFolder(val_folder, transform=val_transform)
+        raw_val_dataset = CustomImageFolder(val_folder, transform=None)
 
-    n = len(dataset)  # total number of examples
-    n_test = int(args.test_split * n)  # take ~10% for test
-    if n_test <= 0 and n > 1:
-        n_test = 1
-    if n_test >= n and n > 1:
-        n_test = n - 1
+        val_dataset_full.samples, bad_val = drop_broken_samples(val_dataset_full.samples)
+        val_dataset_full.imgs = val_dataset_full.samples
+        val_dataset_full.targets = [t for _, t in val_dataset_full.samples]
 
-    indices = torch.randperm(n)
-    val_indices = indices[:n_test].tolist()
-    train_indices = indices[n_test:].tolist()
+        raw_val_dataset.samples, bad_raw_val = drop_broken_samples(
+            raw_val_dataset.samples
+        )
+        raw_val_dataset.imgs = raw_val_dataset.samples
+        raw_val_dataset.targets = [t for _, t in raw_val_dataset.samples]
 
-    train_dataset = torch.utils.data.Subset(dataset, train_indices)
-    val_dataset = torch.utils.data.Subset(val_dataset_full, val_indices)
-    print(
-        f"Split sizes -> train: {len(train_dataset)}, val: {len(val_dataset)} "
-        f"(test_split={args.test_split})"
-    )
+        if bad_val or bad_raw_val:
+            dropped = len(set([p for p, _, _ in bad_val + bad_raw_val]))
+            print(f"[warn] dropped {dropped} broken val images (see paths below)")
+            for p, reason, shape in bad_val + bad_raw_val:
+                print(f"  - {p} | {reason} | shape={shape}")
+
+        val_dataset_full = filter_dataset_to_classnames(
+            val_dataset_full, kept_class_names
+        )
+        raw_val_dataset = filter_dataset_to_classnames(
+            raw_val_dataset, kept_class_names
+        )
+
+        train_indices = list(range(len(dataset)))
+        val_indices = list(range(len(val_dataset_full)))
+        train_dataset = torch.utils.data.Subset(dataset, train_indices)
+        val_dataset = torch.utils.data.Subset(val_dataset_full, val_indices)
+        dataset_sizes = {"train": len(train_dataset), "val": len(val_dataset)}
+        raw_dataset = raw_val_dataset
+        print(
+            f"Using provided val folder '{val_folder}': "
+            f"train={len(train_dataset)}, val={len(val_dataset)}"
+        )
+    else:
+        val_dataset_full = CustomImageFolder(image_folder, transform=val_transform)
+        val_dataset_full.samples = list(dataset.samples)
+        val_dataset_full.imgs = val_dataset_full.samples
+        val_dataset_full.targets = list(dataset.targets)
+        val_dataset_full.classes = list(dataset.classes)
+        val_dataset_full.class_to_idx = dict(dataset.class_to_idx)
+
+        n = len(dataset)  # total number of examples
+        n_test = int(args.test_split * n)  # take ~10% for test
+        if n_test <= 0 and n > 1:
+            n_test = 1
+        if n_test >= n and n > 1:
+            n_test = n - 1
+
+        indices = torch.randperm(n)
+        val_indices = indices[:n_test].tolist()
+        train_indices = indices[n_test:].tolist()
+
+        train_dataset = torch.utils.data.Subset(dataset, train_indices)
+        val_dataset = torch.utils.data.Subset(val_dataset_full, val_indices)
+        dataset_sizes = {"train": len(train_dataset), "val": len(val_dataset)}
+        print(
+            f"Split sizes -> train: {len(train_dataset)}, val: {len(val_dataset)} "
+            f"(test_split={args.test_split})"
+        )
 
     check_dataset = CustomImageFolder(image_folder, transform=check_transform)
-    check_dataset = filter_dataset_to_classnames(check_dataset, kept_class_names)
+    # reuse combined samples for visual check
+    check_dataset.samples = list(dataset.samples)
+    check_dataset.imgs = check_dataset.samples
+    check_dataset.targets = list(dataset.targets)
+    check_dataset.classes = list(dataset.classes)
+    check_dataset.class_to_idx = dict(dataset.class_to_idx)
     Path(os.path.join(model_output_dir, "check")).mkdir(parents=True, exist_ok=True)
     for i, data in zip(range(100), check_dataset):
         img = data[0]
@@ -732,7 +814,7 @@ def main(args):
         print(f"Epoch {epoch}/{args.num_epochs - 1}")
         print("-" * 10)
 
-        # Each epoch has a training and validation phase
+        # Each epoch has a training and dation phase
         for phase in ["train", "val"]:
             if phase == "train":
                 model.train()  # Set model to training mode

@@ -5,7 +5,7 @@ import os
 import timm
 import torch
 
-from albumentations.pytorch import ToTensorV2
+
 from timm.data import resolve_model_data_config
 from train import CutMax, ResizeWithPad, build_model
 from PIL import Image
